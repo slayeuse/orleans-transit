@@ -33,7 +33,12 @@ jobs:
           sed -i 's#android:label="transit_orleans"#android:label="Orléans Transit"#' "$M"
           grep -q 'screenOrientation' "$M" || sed -i 's#<activity#<activity android:screenOrientation="sensorLandscape"#' "$M"
           cat "$M"
-
+  
+      - name: Clé de signature fixe
+        run: |
+          mkdir -p ~/.android
+          if [ -f ci/debug.keystore ]; then cp ci/debug.keystore ~/.android/debug.keystore; fi
+   
       - name: Dépendances
         run: flutter pub get
 
