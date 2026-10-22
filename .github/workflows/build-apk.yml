@@ -45,7 +45,8 @@ jobs:
       - name: Compiler l'APK
         env:
           SNCF_API_KEY: ${{ secrets.SNCF_API_KEY }}
-        run: flutter build apk --release --dart-define=SNCF_API_KEY="$SNCF_API_KEY"
+          CARTO_API_KEY: ${{ secrets.CARTO_API_KEY }}
+        run: flutter build apk --release --dart-define=SNCF_API_KEY="$SNCF_API_KEY" --dart-define=CARTO_API_KEY="$CARTO_API_KEY"
 
       - name: Archiver l'APK
         uses: actions/upload-artifact@v4
