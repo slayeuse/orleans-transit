@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io' show gzip;
 import 'dart:isolate';
 import 'dart:typed_data';
 
@@ -115,7 +116,28 @@ class RtFeed {
 Future<RtFeed> decodeFeedInIsolate(Uint8List bytes) =>
     Isolate.run(() => decodeFeed(bytes));
 
-RtFeed decodeFeed(Uint8List bytes) {
+/// Point d'entrée tolérant : protobuf, protobuf compressé (gzip) ou JSON.
+RtFeed decodeFeed(Uint8List input) {
+  var bytes = input;
+  // gzip non signalé par le serveur
+  if (bytes.length > 2 && bytes[0] == 0x1f && bytes[1] == 0x8b) {
+    bytes = Uint8List.fromList(gzip.decode(bytes));
+  }
+  // Saute d'éventuels espaces / BOM pour détecter du JSON
+  var i = 0;
+  while (i < bytes.length && i < 8 &&
+      (bytes[i] == 0x20 || bytes[i] == 0x0a || bytes[i] == 0x0d ||
+          bytes[i] == 0x09 || bytes[i] == 0xef || bytes[i] == 0xbb ||
+          bytes[i] == 0xbf)) {
+    i++;
+  }
+  if (i < bytes.length && (bytes[i] == 0x7b || bytes[i] == 0x5b)) {
+    return decodeJsonFeed(utf8.decode(bytes, allowMalformed: true));
+  }
+  return _decodeProto(bytes);
+}
+
+RtFeed _decodeProto(Uint8List bytes) {
   final r = _Pb(bytes, 0, bytes.length);
   var ts = 0;
   final trips = <RtTrip>[];
@@ -317,4 +339,72 @@ RtAlert _alert(_Pb r) {
     }
   }
   return RtAlert(header, desc, routes, stops, effect);
+}
+
+
+// ───────────── Variante JSON (GTFS-RT encodé en JSON, camelCase ou snake_case) ─────────────
+
+dynamic _k(Map m, String camel, String snake) => m[camel] ?? m[snake];
+
+int? _int(dynamic v) {
+  if (v is int) return v;
+  if (v is double) return v.round();
+  if (v is String) return int.tryParse(v);
+  return null;
+}
+
+int _rel(dynamic v, Map<String, int> names) {
+  if (v is int) return v;
+  if (v is String) return names[v.toUpperCase()] ?? int.tryParse(v) ?? 0;
+  return 0;
+}
+
+const _tripRel = {'SCHEDULED': 0, 'ADDED': 1, 'UNSCHEDULED': 2, 'CANCELED': 3, 'CANCELLED': 3};
+const _stuRel = {'SCHEDULED': 0, 'SKIPPED': 1, 'NO_DATA': 2};
+
+RtFeed decodeJsonFeed(String text) {
+  final root = jsonDecode(text);
+  final m = root is Map ? root : <String, dynamic>{};
+  final header = m['header'] is Map ? m['header'] as Map : const {};
+  final ts = _int(header['timestamp']) ?? 0;
+  final trips = <RtTrip>[];
+  final ents = m['entity'] ?? m['entities'];
+  if (ents is List) {
+    for (final e in ents) {
+      if (e is! Map) continue;
+      if ((_k(e, 'isDeleted', 'is_deleted')) == true) continue;
+      final tu = _k(e, 'tripUpdate', 'trip_update');
+      if (tu is! Map) continue;
+      final td = tu['trip'] is Map ? tu['trip'] as Map : const {};
+      final tripId = (_k(td, 'tripId', 'trip_id') ?? '').toString();
+      if (tripId.isEmpty) continue;
+      final stus = <RtStu>[];
+      final list = _k(tu, 'stopTimeUpdate', 'stop_time_update');
+      if (list is List) {
+        for (final s in list) {
+          if (s is! Map) continue;
+          final arr = s['arrival'] is Map ? s['arrival'] as Map : const {};
+          final dep = s['departure'] is Map ? s['departure'] as Map : const {};
+          stus.add(RtStu(
+            _int(_k(s, 'stopSequence', 'stop_sequence')) ?? 0,
+            (_k(s, 'stopId', 'stop_id') ?? '').toString(),
+            _int(arr['time']),
+            _int(dep['time']),
+            _int(arr['delay']),
+            _int(dep['delay']),
+            _rel(_k(s, 'scheduleRelationship', 'schedule_relationship'), _stuRel),
+          ));
+        }
+      }
+      stus.sort((a, b) => a.seq.compareTo(b.seq));
+      trips.add(RtTrip(
+        tripId,
+        (_k(td, 'routeId', 'route_id') ?? '').toString(),
+        _int(_k(td, 'directionId', 'direction_id')) ?? 0,
+        _rel(_k(td, 'scheduleRelationship', 'schedule_relationship'), _tripRel),
+        stus,
+      ));
+    }
+  }
+  return RtFeed(ts, trips, const []);
 }

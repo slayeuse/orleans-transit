@@ -377,9 +377,18 @@ class TaoRepository extends ChangeNotifier {
         'Accept': 'application/x-protobuf, application/octet-stream, */*',
       }).timeout(const Duration(seconds: 30));
       if (r.statusCode != 200) throw Exception('HTTP ${r.statusCode}');
-      if (r.bodyBytes.isEmpty) throw Exception('réponse vide');
-      final f = await decodeFeedInIsolate(r.bodyBytes);
-      if (f.trips.isEmpty) throw Exception('flux sans course');
+      final body = r.bodyBytes;
+      if (body.isEmpty) throw Exception('réponse vide');
+      final f = await decodeFeedInIsolate(body);
+      if (f.trips.isEmpty) {
+        final head = body
+            .take(12)
+            .map((b) => b.toRadixString(16).padLeft(2, '0'))
+            .join(' ');
+        final ct = r.headers['content-type'] ?? '?';
+        throw Exception(
+            'flux sans course · ${body.length} o · $ct · $head');
+      }
       _applyFeed(f);
       rtError = null;
       rtErrorDetail = null;
@@ -390,7 +399,7 @@ class TaoRepository extends ChangeNotifier {
     } catch (e) {
       rtError = 'Temps réel TAO indisponible';
       final m = e.toString().replaceFirst('Exception: ', '');
-      rtErrorDetail = m.length > 80 ? m.substring(0, 80) : m;
+      rtErrorDetail = m.length > 160 ? m.substring(0, 160) : m;
     }
     _rtBusy = false;
     notifyListeners();
