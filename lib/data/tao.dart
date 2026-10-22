@@ -151,6 +151,11 @@ class TaoRepository extends ChangeNotifier {
   final Map<String, Set<String>> _groupRoutes = {};
   final Map<String, RtTrip> _rtTrips = {};
 
+  /// Tracés et dessertes (chargés en arrière-plan après les arrêts).
+  NetworkData? network;
+  final Map<String, Set<String>> _groupRoutesStatic = {};
+  final Set<String> tramGroups = {};
+
   // Horaires théoriques par arrêt (calculés à la demande, en arrière-plan).
   final Map<String, (DateTime, List<SchedRow>)> _schedCache = {};
   final Set<String> _schedLoading = {};
@@ -208,7 +213,8 @@ class TaoRepository extends ChangeNotifier {
       final last = Config.prefs.getInt('gtfs_ts');
       final haveFiles = File(p.join(dir, 'stops.txt')).existsSync() &&
           File(p.join(dir, 'routes.txt')).existsSync() &&
-          File(p.join(dir, 'trips.txt')).existsSync();
+          File(p.join(dir, 'trips.txt')).existsSync() &&
+          File(p.join(dir, 'shapes.txt')).existsSync();
       final old = last == null ||
           DateTime.now().millisecondsSinceEpoch - last >
               7 * 24 * 3600 * 1000;
@@ -228,6 +234,7 @@ class TaoRepository extends ChangeNotifier {
       _indexDay = null;
       phase = TaoPhase.ready;
       notifyListeners();
+      unawaited(_loadNetwork(dir));
       await refreshRt(force: true);
     } catch (e) {
       phase = TaoPhase.error;
@@ -317,6 +324,40 @@ class TaoRepository extends ChangeNotifier {
     final sorted = groups.values.toList()
       ..sort((a, b) => a.key.compareTo(b.key));
     sortedGroups = sorted;
+  }
+
+  Future<void> _loadNetwork(String dir) async {
+    try {
+      final n = await loadNetworkInIsolate(dir);
+      network = n;
+      _groupRoutesStatic.clear();
+      tramGroups.clear();
+      n.routeStops.forEach((rid, stops) {
+        final tram = routeOf(rid).isTram;
+        for (final sid in stops) {
+          final g = stopToGroup[sid];
+          if (g == null) continue;
+          _groupRoutesStatic.putIfAbsent(g, () => <String>{}).add(rid);
+          if (tram) tramGroups.add(g);
+        }
+      });
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  /// Groupes d'arrêts desservis par une ligne.
+  Set<String> groupsOfRoute(String routeId) {
+    final out = <String>{};
+    for (final sid in network?.routeStops[routeId] ?? const <String>{}) {
+      final g = stopToGroup[sid];
+      if (g != null) out.add(g);
+    }
+    if (out.isEmpty) {
+      _groupRoutes.forEach((g, routes) {
+        if (routes.contains(routeId)) out.add(g);
+      });
+    }
+    return out;
   }
 
   // ───────────── temps réel ─────────────
@@ -495,8 +536,11 @@ class TaoRepository extends ChangeNotifier {
   }
 
   List<GRoute> routesAt(String groupKey) {
-    final ids = _groupRoutes[groupKey];
-    if (ids == null) return const [];
+    final ids = <String>{
+      ...?_groupRoutes[groupKey],
+      ...?_groupRoutesStatic[groupKey],
+    };
+    if (ids.isEmpty) return const [];
     final list = [for (final id in ids) routeOf(id)]..sort(compareRoutes);
     return list;
   }

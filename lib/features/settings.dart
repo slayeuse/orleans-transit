@@ -14,26 +14,32 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _key;
+  late final TextEditingController _carto;
   bool _show = false;
 
   @override
   void initState() {
     super.initState();
     _key = TextEditingController(text: Config.prefs.getString('sncf_key') ?? '');
+    _carto =
+        TextEditingController(text: Config.prefs.getString('carto_key') ?? '');
   }
 
   @override
   void dispose() {
     _key.dispose();
+    _carto.dispose();
     super.dispose();
   }
 
   Future<void> _save() async {
     await Config.setSncfKey(_key.text);
+    await Config.setCartoKey(_carto.text);
     await App.ter.resetStations();
     if (!mounted) return;
     ScaffoldMessenger.of(context)
-        .showSnackBar(const SnackBar(content: Text('Clé enregistrée')));
+        .showSnackBar(const SnackBar(content: Text('Clés enregistrées')));
+    setState(() {});
     App.ter.refresh(force: true);
   }
 
@@ -76,6 +82,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             color: C.grey),
                       ),
                     ),
+                  ),
+                  const SizedBox(height: 14),
+                  const SectionLabel('Clé CARTO (fond de carte)', color: C.yellow),
+                  const SizedBox(height: 6),
+                  Text(
+                    Config.hasBuildCartoKey
+                        ? 'Une clé CARTO a été intégrée à la compilation.'
+                        : 'Sans clé, la carte affiche un filigrane CARTO.',
+                    style: ts(12.5, c: C.grey, h: 1.35),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: _carto,
+                    obscureText: !_show,
+                    style: ts(14, w: FontWeight.w600),
+                    decoration: inputDeco(
+                        'Clé CARTO (laisser vide = clé intégrée)',
+                        Icons.map_rounded),
                   ),
                   const SizedBox(height: 12),
                   YellowButton('ENREGISTRER', onTap: _save),

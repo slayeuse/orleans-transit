@@ -31,6 +31,29 @@ class Config {
 
   static bool get hasBuildKey => _envKey.trim().isNotEmpty;
 
+  /// Clé CARTO (fonds de carte) : --dart-define=CARTO_API_KEY=... ou Réglages.
+  static const _envCarto = String.fromEnvironment('CARTO_API_KEY');
+
+  static String get cartoKey {
+    final k = prefs.getString('carto_key');
+    if (k != null && k.trim().isNotEmpty) return k.trim();
+    return _envCarto.trim();
+  }
+
+  static bool get hasBuildCartoKey => _envCarto.trim().isNotEmpty;
+
+  static Future<void> setCartoKey(String k) async {
+    await prefs.setString('carto_key', k.trim());
+  }
+
+  /// Gabarit des tuiles CARTO (fond sombre, haute définition).
+  static String cartoTiles({bool labels = true}) {
+    final style = labels ? 'dark_all' : 'dark_nolabels';
+    final key = cartoKey;
+    final q = key.isEmpty ? '' : '?key=${Uri.encodeQueryComponent(key)}';
+    return 'https://basemaps.cartocdn.com/rastertiles/$style/{z}/{x}/{y}@2x.png$q';
+  }
+
   static Future<void> setSncfKey(String k) async {
     await prefs.setString('sncf_key', k.trim());
   }

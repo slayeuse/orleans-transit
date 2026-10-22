@@ -176,6 +176,7 @@ const _wanted = {
   'trips.txt',
   'calendar.txt',
   'calendar_dates.txt',
+  'shapes.txt',
 };
 
 Future<void> extractGtfs(String zipPath, String dir) async {
@@ -403,3 +404,122 @@ Future<List<SchedRow>> scheduleForStopsInIsolate(String dir, Set<String> stopIds
 Future<Map<String, int>> buildStopTimesIndexInIsolate(
         String path, Set<String> tripIds) =>
     Isolate.run(() => buildStopTimesIndex(path, tripIds));
+
+
+// ───────────── Réseau : tracés des lignes + arrêts desservis (pour la carte) ─────────────
+
+class NetworkData {
+  /// route_id -> tracés (chaque tracé : [lat, lon, lat, lon, …]).
+  final Map<String, List<List<double>>> shapes;
+
+  /// route_id -> arrêts desservis.
+  final Map<String, Set<String>> routeStops;
+  const NetworkData(this.shapes, this.routeStops);
+}
+
+Future<NetworkData> loadNetwork(String dir) async {
+  final tripsFile = File(p.join(dir, 'trips.txt'));
+  if (!tripsFile.existsSync()) return const NetworkData({}, {});
+  final tripRoute = <String, String>{};
+  // route -> shape -> nombre de courses
+  final shapeCount = <String, Map<String, int>>{};
+  for (final r in _readCsv(tripsFile.path)) {
+    final tid = r['trip_id'];
+    final rid = r['route_id'];
+    if (tid == null || rid == null) continue;
+    tripRoute[tid] = rid;
+    final sh = r['shape_id'];
+    if (sh != null && sh.isNotEmpty) {
+      final m = shapeCount.putIfAbsent(rid, () => <String, int>{});
+      m[sh] = (m[sh] ?? 0) + 1;
+    }
+  }
+  // Les 2 tracés les plus utilisés par ligne (un par sens en général).
+  final wanted = <String, String>{}; // shape -> route
+  shapeCount.forEach((rid, m) {
+    final list = m.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
+    for (final e in list.take(2)) {
+      wanted[e.key] = rid;
+    }
+  });
+
+  final routeStops = <String, Set<String>>{};
+  final st = File(p.join(dir, 'stop_times.txt'));
+  if (st.existsSync()) {
+    var iTrip = -1, iStop = -1;
+    var header = true;
+    final lines = st
+        .openRead()
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .transform(const LineSplitter());
+    await for (final line in lines) {
+      if (line.isEmpty) continue;
+      if (header) {
+        final h = parseCsvLine(line.replaceFirst('﻿', ''))
+            .map((e) => e.trim())
+            .toList();
+        iTrip = h.indexOf('trip_id');
+        iStop = h.indexOf('stop_id');
+        if (iTrip < 0 || iStop < 0) break;
+        header = false;
+        continue;
+      }
+      final c = parseCsvLine(line);
+      if (c.length <= iTrip || c.length <= iStop) continue;
+      final rid = tripRoute[c[iTrip].trim()];
+      if (rid == null) continue;
+      routeStops.putIfAbsent(rid, () => <String>{}).add(c[iStop].trim());
+    }
+  }
+
+  final pts = <String, List<(int, double, double)>>{};
+  final shp = File(p.join(dir, 'shapes.txt'));
+  if (shp.existsSync() && wanted.isNotEmpty) {
+    var iId = -1, iLat = -1, iLon = -1, iSeq = -1;
+    var header = true;
+    final lines = shp
+        .openRead()
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .transform(const LineSplitter());
+    await for (final line in lines) {
+      if (line.isEmpty) continue;
+      if (header) {
+        final h = parseCsvLine(line.replaceFirst('﻿', ''))
+            .map((e) => e.trim())
+            .toList();
+        iId = h.indexOf('shape_id');
+        iLat = h.indexOf('shape_pt_lat');
+        iLon = h.indexOf('shape_pt_lon');
+        iSeq = h.indexOf('shape_pt_sequence');
+        if (iId < 0 || iLat < 0 || iLon < 0) break;
+        header = false;
+        continue;
+      }
+      final c = parseCsvLine(line);
+      if (c.length <= iId || c.length <= iLat || c.length <= iLon) continue;
+      final id = c[iId].trim();
+      if (!wanted.containsKey(id)) continue;
+      final lat = double.tryParse(c[iLat].trim());
+      final lon = double.tryParse(c[iLon].trim());
+      if (lat == null || lon == null) continue;
+      final seq = (iSeq >= 0 && iSeq < c.length) ? (int.tryParse(c[iSeq].trim()) ?? 0) : 0;
+      pts.putIfAbsent(id, () => <(int, double, double)>[]).add((seq, lat, lon));
+    }
+  }
+  final shapes = <String, List<List<double>>>{};
+  pts.forEach((id, list) {
+    list.sort((a, b) => a.$1.compareTo(b.$1));
+    final flat = <double>[];
+    for (final e in list) {
+      flat
+        ..add(e.$2)
+        ..add(e.$3);
+    }
+    final rid = wanted[id]!;
+    shapes.putIfAbsent(rid, () => <List<double>>[]).add(flat);
+  });
+  return NetworkData(shapes, routeStops);
+}
+
+Future<NetworkData> loadNetworkInIsolate(String dir) =>
+    Isolate.run(() => loadNetwork(dir));
