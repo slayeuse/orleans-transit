@@ -169,7 +169,14 @@ Future<void> downloadFile(
   }
 }
 
-const _wanted = {'stops.txt', 'routes.txt', 'stop_times.txt'};
+const _wanted = {
+  'stops.txt',
+  'routes.txt',
+  'stop_times.txt',
+  'trips.txt',
+  'calendar.txt',
+  'calendar_dates.txt',
+};
 
 Future<void> extractGtfs(String zipPath, String dir) async {
   final input = InputFileStream(zipPath);
@@ -244,6 +251,154 @@ Future<Map<String, int>> buildStopTimesIndex(
   }
   return out;
 }
+
+// ───────────── Horaires théoriques d'un arrêt (secours si pas de temps réel) ─────────────
+
+class SchedRow {
+  final String tripId;
+  final String stopId;
+  final int seq;
+
+  /// Secondes depuis minuit du jour courant.
+  final int secs;
+  final String routeId;
+  final int dir;
+  final String lastStopId;
+  const SchedRow(this.tripId, this.stopId, this.seq, this.secs, this.routeId,
+      this.dir, this.lastStopId);
+}
+
+String _ymd(DateTime d) =>
+    '${d.year.toString().padLeft(4, '0')}${d.month.toString().padLeft(2, '0')}${d.day.toString().padLeft(2, '0')}';
+
+/// Services actifs un jour donné (calendar.txt + calendar_dates.txt).
+Set<String> _activeServices(String dir, DateTime day) {
+  final ymd = _ymd(day);
+  const cols = [
+    'monday',
+    'tuesday',
+    'wednesday',
+    'thursday',
+    'friday',
+    'saturday',
+    'sunday'
+  ];
+  final col = cols[day.weekday - 1];
+  final out = <String>{};
+  for (final r in _readCsv(p.join(dir, 'calendar.txt'))) {
+    final id = r['service_id'];
+    if (id == null) continue;
+    final start = r['start_date'] ?? '00000000';
+    final end = r['end_date'] ?? '99999999';
+    if (ymd.compareTo(start) < 0 || ymd.compareTo(end) > 0) continue;
+    if (r[col] == '1') out.add(id);
+  }
+  for (final r in _readCsv(p.join(dir, 'calendar_dates.txt'))) {
+    if (r['date'] != ymd) continue;
+    final id = r['service_id'];
+    if (id == null) continue;
+    if (r['exception_type'] == '1') {
+      out.add(id);
+    } else if (r['exception_type'] == '2') {
+      out.remove(id);
+    }
+  }
+  return out;
+}
+
+/// Lit stop_times.txt en flux et renvoie les passages prévus aux arrêts demandés,
+/// entre fromSod et toSod (secondes depuis minuit aujourd'hui).
+Future<List<SchedRow>> scheduleForStops(String dir, Set<String> stopIds,
+    DateTime today, int fromSod, int toSod) async {
+  final st = File(p.join(dir, 'stop_times.txt'));
+  final tripsFile = File(p.join(dir, 'trips.txt'));
+  if (!st.existsSync() || !tripsFile.existsSync()) return const [];
+
+  final hasCalendar = File(p.join(dir, 'calendar.txt')).existsSync() ||
+      File(p.join(dir, 'calendar_dates.txt')).existsSync();
+  final sToday = _activeServices(dir, today);
+  final sYest =
+      _activeServices(dir, DateTime(today.year, today.month, today.day - 1));
+
+  // trip -> (route, direction, roule aujourd'hui, roulait hier)
+  final info = <String, (String, int, bool, bool)>{};
+  for (final r in _readCsv(tripsFile.path)) {
+    final tid = r['trip_id'];
+    final sid = r['service_id'] ?? '';
+    if (tid == null || tid.isEmpty) continue;
+    final t = !hasCalendar || sToday.contains(sid);
+    final y = hasCalendar && sYest.contains(sid);
+    if (!t && !y) continue;
+    info[tid] = (
+      r['route_id'] ?? '',
+      int.tryParse(r['direction_id'] ?? '') ?? 0,
+      t,
+      y,
+    );
+  }
+
+  final lastSeq = <String, int>{};
+  final lastStop = <String, String>{};
+  final raw = <(String, String, int, int)>[];
+  var iTrip = -1, iArr = -1, iDep = -1, iStop = -1, iSeq = -1, maxI = 0;
+  var header = true;
+  final lines = st
+      .openRead()
+      .transform(const Utf8Decoder(allowMalformed: true))
+      .transform(const LineSplitter());
+  await for (final line in lines) {
+    if (line.isEmpty) continue;
+    if (header) {
+      final h = parseCsvLine(line.replaceFirst('﻿', ''))
+          .map((e) => e.trim())
+          .toList();
+      iTrip = h.indexOf('trip_id');
+      iArr = h.indexOf('arrival_time');
+      iDep = h.indexOf('departure_time');
+      iStop = h.indexOf('stop_id');
+      iSeq = h.indexOf('stop_sequence');
+      if (iTrip < 0 || iStop < 0 || (iArr < 0 && iDep < 0)) return const [];
+      for (final i in [iTrip, iArr, iDep, iStop, iSeq]) {
+        if (i > maxI) maxI = i;
+      }
+      header = false;
+      continue;
+    }
+    final c = parseCsvLine(line);
+    if (c.length <= maxI) continue;
+    final trip = c[iTrip].trim();
+    final inf = info[trip];
+    if (inf == null) continue;
+    final stop = c[iStop].trim();
+    final seq = iSeq >= 0 ? (int.tryParse(c[iSeq].trim()) ?? 0) : 0;
+    if (seq >= (lastSeq[trip] ?? -1)) {
+      lastSeq[trip] = seq;
+      lastStop[trip] = stop;
+    }
+    if (!stopIds.contains(stop)) continue;
+    var secs = iDep >= 0 ? _secs(c[iDep]) : -1;
+    if (secs < 0 && iArr >= 0) secs = _secs(c[iArr]);
+    if (secs < 0) continue;
+    if (inf.$3 && secs >= fromSod && secs <= toSod) {
+      raw.add((trip, stop, seq, secs));
+    }
+    final y = secs - 86400;
+    if (inf.$4 && y >= fromSod && y <= toSod) raw.add((trip, stop, seq, y));
+  }
+
+  final out = <SchedRow>[];
+  for (final r in raw) {
+    final inf = info[r.$1]!;
+    out.add(SchedRow(r.$1, r.$2, r.$3, r.$4, inf.$1, inf.$2,
+        lastStop[r.$1] ?? r.$2));
+  }
+  out.sort((a, b) => a.secs.compareTo(b.secs));
+  return out;
+}
+
+Future<List<SchedRow>> scheduleForStopsInIsolate(String dir, Set<String> stopIds,
+        DateTime today, int fromSod, int toSod) =>
+    Isolate.run(() => scheduleForStops(dir, stopIds, today, fromSod, toSod));
 
 Future<Map<String, int>> buildStopTimesIndexInIsolate(
         String path, Set<String> tripIds) =>

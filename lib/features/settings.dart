@@ -108,6 +108,40 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         ]),
         const SizedBox(height: 14),
+        ListenableBuilder(
+          listenable: App.tao,
+          builder: (context, _) {
+            final t = App.tao;
+            final ok = t.rtError == null && t.rtFetchedAt != null;
+            final at = t.rtFetchedAt;
+            return Panel(
+              child: Row(children: [
+                Icon(ok ? Icons.check_circle_rounded : Icons.error_rounded,
+                    color: ok ? C.green : C.red),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const SectionLabel('Diagnostic temps réel TAO',
+                          color: C.yellow),
+                      const SizedBox(height: 4),
+                      Text(
+                        ok
+                            ? 'OK · ${t.rtTripCount} courses suivies · MAJ ${hhmm(at!)}'
+                            : 'Erreur : ${t.rtErrorDetail ?? t.rtError ?? 'pas encore chargé'}'
+                                '${at != null ? ' · dernier succès ${hhmm(at)}' : ''}',
+                        style: ts(13, w: FontWeight.w700),
+                      ),
+                    ],
+                  ),
+                ),
+                YellowButton('TESTER', onTap: () => t.refreshRt(force: true)),
+              ]),
+            );
+          },
+        ),
+        const SizedBox(height: 14),
         Panel(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,

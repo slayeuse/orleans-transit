@@ -18,6 +18,7 @@ Color healthColor(LineHealth h) => switch (h) {
 /// Couleur d'un horaire TAO : rouge = supprimé/retard, vert = à l'heure.
 Color depColor(TaoDeparture d) {
   if (d.cancelled) return C.red;
+  if (d.theoretical) return const Color(0xFFD1D1D6);
   final dl = d.delayMin;
   if (dl == null) return Colors.white;
   if (dl >= 2) return C.red;
@@ -403,8 +404,15 @@ class StopBoard extends StatelessWidget {
           const Divider(height: 1, color: C.stroke),
           Expanded(
             child: rows.isEmpty
-                ? const EmptyState(Icons.schedule_rounded,
-                    'Aucun passage annoncé pour le moment')
+                ? (r.isScheduleLoading(groupKey)
+                    ? Column(mainAxisSize: MainAxisSize.min, mainAxisAlignment: MainAxisAlignment.center, children: [
+                        const CircularProgressIndicator(color: C.yellow),
+                        const SizedBox(height: 14),
+                        Text('Chargement des horaires…',
+                            style: ts(13, c: C.grey, w: FontWeight.w700)),
+                      ])
+                    : const EmptyState(Icons.schedule_rounded,
+                        'Aucun passage dans les 4 prochaines heures'))
                 : LayoutBuilder(
                     builder: (context, c) {
                       final cells = c.maxWidth > 560 ? 3 : 2;
@@ -490,7 +498,9 @@ class _TimeCell extends StatelessWidget {
     final dl = d.delayMin;
     final sub = d.cancelled
         ? hhmm(d.time)
-        : (dl != null && dl >= 1 ? '${hhmm(d.time)} +$dl' : hhmm(d.time));
+        : d.theoretical
+            ? '${hhmm(d.time)} théo.'
+            : (dl != null && dl >= 1 ? '${hhmm(d.time)} +$dl' : hhmm(d.time));
     final w = compact ? 58.0 : (first ? 78.0 : 56.0);
     return SizedBox(
       width: w,
@@ -523,6 +533,44 @@ class _TimeCell extends StatelessWidget {
 
 void showTripSheet(BuildContext context, TaoDeparture d, Set<String> highlight) {
   final r = App.tao;
+  if (d.theoretical) {
+    showAppSheet(
+      context,
+      (ctx) => SheetFrame(
+        header: Row(children: [
+          LineBullet(d.route.short,
+              color: d.route.color, textColor: d.route.textColor, size: 48),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Text('→ ${d.dest.toUpperCase()}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: ts(21, w: FontWeight.w900)),
+          ),
+          const StatusChip('THÉORIQUE', color: C.grey),
+        ]),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+                'Cette course n\'est pas (encore) suivie en temps réel : horaire prévu par TAO.',
+                style: ts(13, c: C.grey, h: 1.35)),
+            const SizedBox(height: 8),
+            Expanded(
+              child: Timeline(color: d.route.color, stops: [
+                TimelineStop(
+                    name: r.stopName(d.stu.stopId),
+                    time: hhmm(d.time),
+                    highlight: true),
+                TimelineStop(name: d.dest, note: 'TERMINUS'),
+              ]),
+            ),
+          ],
+        ),
+      ),
+    );
+    return;
+  }
   final stus = d.trip.stus;
   var focus = 0;
   final stops = <TimelineStop>[];

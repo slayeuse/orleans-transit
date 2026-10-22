@@ -37,8 +37,24 @@ class TaoDeparture {
   final DateTime time;
   final int? delayMin;
   final bool cancelled;
+
+  /// Horaire prévu uniquement (course non suivie en temps réel).
+  final bool theoretical;
   const TaoDeparture(this.trip, this.stu, this.route, this.dest, this.time,
-      this.delayMin, this.cancelled);
+      this.delayMin, this.cancelled,
+      {this.theoretical = false});
+}
+
+/// « Clos du Hameau - Quai C » -> « Clos du Hameau »
+final _quaySuffix = RegExp(r'\s*[-–—/]\s*(quai|qu\.|q\.)\s*[A-Za-z0-9]{1,3}\s*$',
+    caseSensitive: false);
+final _quayOnly =
+    RegExp(r'\s+(quai)\s+[A-Za-z0-9]{1,2}\s*$', caseSensitive: false);
+
+String cleanStopName(String name) {
+  var s = name.replaceFirst(_quaySuffix, '');
+  s = s.replaceFirst(_quayOnly, '').trim();
+  return s.isEmpty ? name.trim() : s;
 }
 
 class BoardRow {
@@ -130,8 +146,15 @@ class TaoRepository extends ChangeNotifier {
   DateTime? rtFetchedAt;
   String? rtError;
   bool _rtBusy = false;
+  String? rtErrorDetail;
   final Map<String, List<StopHit>> _byStop = {};
   final Map<String, Set<String>> _groupRoutes = {};
+  final Map<String, RtTrip> _rtTrips = {};
+
+  // Horaires théoriques par arrêt (calculés à la demande, en arrière-plan).
+  final Map<String, (DateTime, List<SchedRow>)> _schedCache = {};
+  final Set<String> _schedLoading = {};
+  Future<void> _schedChain = Future<void>.value();
 
   Map<String, int>? _sched;
   Set<String> _indexedTrips = {};
@@ -184,7 +207,8 @@ class TaoRepository extends ChangeNotifier {
       _dir = dir;
       final last = Config.prefs.getInt('gtfs_ts');
       final haveFiles = File(p.join(dir, 'stops.txt')).existsSync() &&
-          File(p.join(dir, 'routes.txt')).existsSync();
+          File(p.join(dir, 'routes.txt')).existsSync() &&
+          File(p.join(dir, 'trips.txt')).existsSync();
       final old = last == null ||
           DateTime.now().millisecondsSinceEpoch - last >
               7 * 24 * 3600 * 1000;
@@ -199,6 +223,7 @@ class TaoRepository extends ChangeNotifier {
       notifyListeners();
       data = await loadStaticInIsolate(dir);
       _buildGroups();
+      _schedCache.clear();
       _sched = null;
       _indexDay = null;
       phase = TaoPhase.ready;
@@ -241,7 +266,7 @@ class TaoRepository extends ChangeNotifier {
     final byKey = <String, List<GStop>>{};
     for (final s in d.stops.values) {
       if (s.type > 1) continue; // entrées, nœuds… ignorés
-      final k = norm(s.name);
+      final k = norm(cleanStopName(s.name));
       if (k.isEmpty) continue;
       byKey.putIfAbsent(k, () => <GStop>[]).add(s);
     }
@@ -274,7 +299,8 @@ class TaoRepository extends ChangeNotifier {
       for (var ci = 0; ci < clusters.length; ci++) {
         final c = clusters[ci];
         final key = ci == 0 ? k : '$k ${ci + 1}';
-        final label = ci == 0 ? c.first.name : '${c.first.name} (${ci + 1})';
+        final base = cleanStopName(c.first.name);
+        final label = ci == 0 ? base : '$base (${ci + 1})';
         var lat = 0.0, lon = 0.0, n = 0;
         for (final s in c) {
           if (s.lat != 0 && s.lon != 0) {
@@ -306,15 +332,24 @@ class TaoRepository extends ChangeNotifier {
     _rtBusy = true;
     try {
       final r = await http.get(Uri.parse(Config.taoRtUrl), headers: {
-        'User-Agent': Config.userAgent
-      }).timeout(const Duration(seconds: 25));
+        'User-Agent': Config.userAgent,
+        'Accept': 'application/x-protobuf, application/octet-stream, */*',
+      }).timeout(const Duration(seconds: 30));
       if (r.statusCode != 200) throw Exception('HTTP ${r.statusCode}');
+      if (r.bodyBytes.isEmpty) throw Exception('réponse vide');
       final f = await decodeFeedInIsolate(r.bodyBytes);
+      if (f.trips.isEmpty) throw Exception('flux sans course');
       _applyFeed(f);
       rtError = null;
+      rtErrorDetail = null;
       rtFetchedAt = DateTime.now();
+    } on TimeoutException {
+      rtError = 'Temps réel TAO indisponible';
+      rtErrorDetail = 'délai dépassé';
     } catch (e) {
       rtError = 'Temps réel TAO indisponible';
+      final m = e.toString().replaceFirst('Exception: ', '');
+      rtErrorDetail = m.length > 80 ? m.substring(0, 80) : m;
     }
     _rtBusy = false;
     notifyListeners();
@@ -325,7 +360,9 @@ class TaoRepository extends ChangeNotifier {
     feed = f;
     _byStop.clear();
     _groupRoutes.clear();
+    _rtTrips.clear();
     for (final t in f.trips) {
+      _rtTrips[t.tripId] = t;
       for (final s in t.stus) {
         _byStop.putIfAbsent(s.stopId, () => <StopHit>[]).add(StopHit(t, s));
         final g = stopToGroup[s.stopId];
@@ -414,7 +451,48 @@ class TaoRepository extends ChangeNotifier {
     return GRoute(id, short, '', 0xFF8E8E93, 0xFFFFFFFF, 3);
   }
 
-  String stopName(String id) => data?.stops[id]?.name ?? id.split(':').last;
+  String stopName(String id) {
+    final n = data?.stops[id]?.name;
+    return n == null ? id.split(':').last : cleanStopName(n);
+  }
+
+  int get rtTripCount => feed?.trips.length ?? 0;
+
+  bool isScheduleLoading(String key) => _schedLoading.contains(key);
+
+  /// Horaires théoriques d'un groupe d'arrêts (null tant qu'ils se calculent).
+  List<SchedRow>? _schedule(String key) {
+    final c = _schedCache[key];
+    final now = DateTime.now();
+    final fresh = c != null &&
+        c.$1.day == now.day &&
+        now.difference(c.$1).inMinutes < 20;
+    if (!fresh) _loadSchedule(key);
+    return c?.$2;
+  }
+
+  void _loadSchedule(String key) {
+    final dir = _dir;
+    final g = groups[key];
+    if (dir == null || g == null || _schedLoading.contains(key)) return;
+    _schedLoading.add(key);
+    final ids = g.ids.toSet();
+    _schedChain = _schedChain.then((_) async {
+      final now = DateTime.now();
+      final today = DateTime(now.year, now.month, now.day);
+      final sod = now.difference(today).inSeconds;
+      List<SchedRow> rows;
+      try {
+        rows = await scheduleForStopsInIsolate(
+            dir, ids, today, sod - 120, sod + 4 * 3600);
+      } catch (_) {
+        rows = const [];
+      }
+      _schedCache[key] = (now, rows);
+      _schedLoading.remove(key);
+      notifyListeners();
+    });
+  }
 
   List<GRoute> routesAt(String groupKey) {
     final ids = _groupRoutes[groupKey];
@@ -449,16 +527,67 @@ class TaoRepository extends ChangeNotifier {
   List<TaoDeparture> departuresFor(String key, {int limit = 80}) {
     final g = groups[key];
     if (g == null) return const [];
+    final ids = g.ids.toSet();
     final now = nowSec() - 30;
     final list = <TaoDeparture>[];
-    for (final id in g.ids) {
-      for (final h in _byStop[id] ?? const <StopHit>[]) {
-        final t = h.stu.time;
-        if (t < now) continue;
-        // terminus : pas de départ
-        if (h.trip.stus.length > 1 && identical(h.stu, h.trip.stus.last)) {
-          continue;
+    final seen = <String>{};
+
+    bool isTerminus(RtTrip t, RtStu s) =>
+        t.stus.length > 1 && identical(s, t.stus.last);
+
+    // 1) Horaires prévus, remplacés par le temps réel quand la course est suivie.
+    final sched = _schedule(key);
+    if (sched != null) {
+      final now0 = DateTime.now();
+      final midnight =
+          DateTime(now0.year, now0.month, now0.day).millisecondsSinceEpoch ~/
+              1000;
+      for (final row in sched) {
+        final rt = _rtTrips[row.tripId];
+        if (rt != null) {
+          RtStu? hit;
+          for (final s in rt.stus) {
+            if (ids.contains(s.stopId)) {
+              hit = s;
+              break;
+            }
+          }
+          if (hit == null) {
+            for (final s in rt.stus) {
+              if (s.seq == row.seq) {
+                hit = s;
+                break;
+              }
+            }
+          }
+          final h = hit;
+          if (h != null) {
+            seen.add(row.tripId);
+            if (h.time >= now && !isTerminus(rt, h)) {
+              list.add(_dep(StopHit(rt, h)));
+            }
+            continue;
+          }
         }
+        if (row.stopId == row.lastStopId) continue; // terminus
+        final t = midnight + row.secs;
+        if (t < now) continue;
+        seen.add(row.tripId);
+        final stu = RtStu(row.seq, row.stopId, null, t, null, null, 0);
+        final end = RtStu(row.seq + 10000, row.lastStopId, null, null, null, null, 0);
+        final trip = RtTrip(row.tripId, row.routeId, row.dir, 0, [stu, end]);
+        list.add(TaoDeparture(trip, stu, routeOf(row.routeId),
+            stopName(row.lastStopId), fromEpoch(t), null, false,
+            theoretical: true));
+      }
+    }
+
+    // 2) Passages temps réel non couverts par les horaires prévus.
+    for (final id in ids) {
+      for (final h in _byStop[id] ?? const <StopHit>[]) {
+        if (seen.contains(h.trip.tripId)) continue;
+        if (h.stu.time < now) continue;
+        if (isTerminus(h.trip, h.stu)) continue;
         list.add(_dep(h));
       }
     }
@@ -613,7 +742,9 @@ class TaoRepository extends ChangeNotifier {
   String get statusLine {
     final at = rtFetchedAt;
     final parts = <String>[];
-    if (rtError != null) parts.add(rtError!);
+    if (rtError != null) {
+      parts.add(rtErrorDetail == null ? rtError! : '$rtError ($rtErrorDetail)');
+    }
     if (at != null) parts.add('MAJ ${hhmm(at)} · temps réel TAO');
     if (indexing) parts.add('calcul des retards…');
     return parts.join(' · ');
