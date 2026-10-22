@@ -51,7 +51,10 @@ class _Pb {
         pos += 8;
         break;
       case 2:
-        pos += varint();
+        // Attention : lire la longueur AVANT d'avancer (pos += varint() lirait
+        // l'ancienne position, avant que varint() ne la déplace).
+        final len = varint();
+        pos += len;
         break;
       case 5:
         pos += 4;
